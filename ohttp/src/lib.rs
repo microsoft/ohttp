@@ -339,7 +339,7 @@ impl ServerResponse {
                     // AEAD-Protected Chunk (..),
                     enc_response.append(&mut ct);
 
-                    info!("Encapsulated chunk {}", hex::encode(&enc_response));
+                    info!("Encapsulated chunk {}({})", hex::encode(&enc_response), enc_response.len());
                     yield Ok(enc_response);
                     current = next.unwrap();
                 } else {
@@ -355,7 +355,7 @@ impl ServerResponse {
                     let mut enc_length = self.variant_encode(ct.len());
                     enc_response.append(&mut enc_length);
                     enc_response.append(&mut ct);
-                    info!("Encapsulated final chunk {}", hex::encode(&enc_response));
+                    info!("Encapsulated final chunk {}({})", hex::encode(&enc_response), enc_response.len());
                     yield Ok(enc_response);
                     return;
                 }
@@ -461,46 +461,46 @@ impl ClientResponse {
     where
         S: Stream<Item = Res<Vec<u8>>> + Send + 'static + Unpin,
     {
-        // Response Nonce (Nk)
-        if let Some(nonce) = stream.next().await {
-            let enc_response = nonce.unwrap();
-            info!("Setting response nonce: {}({})", hex::encode(&enc_response), enc_response.len());
-            self.set_response_nonce(&enc_response).unwrap();
-        }
-
+        let mut nonce_received = false;
+        let mut aad = "";
+        let nonce_size = entropy(self.hpke.config());
+        let mut buffer: Vec<u8> = Vec::new();
         let output_stream = stream! {
             while let Some(next) = stream.next().await {
                 let mut enc_response = next.unwrap();
-                if enc_response.is_empty() { return };
-                info!("Decrypting chunk: {}({})", hex::encode(&enc_response), enc_response.len());
-                let (len, bytes_read) = self.variant_decode(&enc_response).unwrap();
-                info!("Chunk length: {}, bytes read {}", len, bytes_read);
-                if len != 0 {
-                    let aad = "";
-                    let (_, ct) = enc_response.split_at(bytes_read);
-                    let mut current = ct.to_vec();
-                    while (current.len() as u64) < len {
-                        enc_response = stream.next().await.unwrap().unwrap();
-                        info!("Appending chunk: {}({})", hex::encode(&enc_response), enc_response.len());
-                        current.append(&mut enc_response);
+                info!("Recevied chunk: {}({})", hex::encode(&enc_response), enc_response.len());
+                buffer.append(&mut enc_response);
+                info!("Buffer size {}", buffer.len());
+
+                // Response Nonce (Nk)
+                if !nonce_received && buffer.len() >= nonce_size {
+                    nonce_received = true;
+                    let nonce: Vec<_> = buffer.drain(0..nonce_size).collect();
+                    info!("Setting response nonce: {}({})", hex::encode(&nonce), nonce.len());
+                    self.set_response_nonce(&nonce).unwrap();
+                }
+
+                if !buffer.is_empty() {
+                    let (mut len, bytes_read) = self.variant_decode(&buffer).unwrap();
+                    info!("Buffer state: {}, {}({})", buffer.len(), len, bytes_read);
+
+                    if len == 0 {
+                        buffer.drain(0..bytes_read);
+                        info!("Processing final chunk");
+                        // Final Response Chunk Indicator (i) = 0,
+                        aad = "final";
+                        let (length, bytes_read) = self.variant_decode(&buffer).unwrap();
+                        info!("Buffer state: {}, {}({})", buffer.len(), length, bytes_read);
+                        len = length;
                     }
-                    self.seq += 1;
-                    yield self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &current);
-                } else {
-                    let (_, rest) = enc_response.split_at(bytes_read);
-                    let (_, bytes_read) = self.variant_decode(&rest).unwrap();
-                    let (_, ct) = rest.split_at(bytes_read);
-                    // Read to the end
-                    let mut current = ct.to_vec();
-                    while let Some(next) = stream.next().await {
-                        enc_response = next.unwrap();
-                        info!("Appending chunk: {}({})", hex::encode(&enc_response), enc_response.len());
-                        current.append(&mut enc_response);
+
+                    if buffer.len() >= (len as usize){
+                        buffer.drain(0..bytes_read);
+                        let ct: Vec<_> = buffer.drain(0..(len as usize)).collect();
+                        info!("Decapsulating chunk {}({})", hex::encode(&ct), len);
+                        self.seq += 1;
+                        yield self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &ct);
                     }
-                    let aad = "final";
-                    self.seq += 1;
-                    yield self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &current);
-                    return;
                 }
             }
         };
