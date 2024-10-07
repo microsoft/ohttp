@@ -57,7 +57,7 @@ impl Kem {
     pub fn n_pk(self) -> usize {
         match self {
             Kem::P384Sha384 => 97,
-            
+
             Kem::X25519Sha256 => 32,
 
             #[cfg(feature = "pq")]

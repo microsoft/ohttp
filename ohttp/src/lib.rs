@@ -1,4 +1,3 @@
-#![deny(clippy::pedantic)]
 #![allow(clippy::missing_errors_doc)] // I'm too lazy
 #![cfg_attr(
     not(all(feature = "client", feature = "server")),
@@ -267,6 +266,7 @@ impl ServerResponse {
     fn variant_encode(&mut self, mut val: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
         loop {
+            #[allow(clippy::cast_possible_truncation)]
             let mut byte = (val & 0x7F) as u8; // Take the last 7 bits
             val >>= 7; // Shift right by 7 bits
             if val != 0 {
@@ -315,7 +315,10 @@ impl ServerResponse {
     {
         // Response Nonce (Nk)
         let response_nonce = Ok(self.response_nonce.clone());
-        info!("Response nonce {}", hex::encode(&self.response_nonce.clone()));
+        info!(
+            "Response nonce {}",
+            hex::encode(self.response_nonce.clone())
+        );
         let nonce_stream = once(async { response_nonce });
 
         let mut input = Box::pin(input);
@@ -323,9 +326,9 @@ impl ServerResponse {
             let current = input.next().await;
             let Some(current) = current else { return };
             let Ok(mut current) = current else { return };
-            
+
             loop {
-                info!("Processing chunk {}", std::str::from_utf8(&current).unwrap());
+                //info!("Processing chunk {}", std::str::from_utf8(&current).unwrap());
                 if let Some(next) = input.next().await {
                     let mut enc_response = Vec::new();
 
@@ -339,7 +342,7 @@ impl ServerResponse {
                     // AEAD-Protected Chunk (..),
                     enc_response.append(&mut ct);
 
-                    info!("Encapsulated chunk {}({})", hex::encode(&enc_response), enc_response.len());
+                    info!("Encapsulated chunk {}({},{})", hex::encode(&enc_response), ct.len(), enc_response.len());
                     yield Ok(enc_response);
                     current = next.unwrap();
                 } else {
@@ -355,7 +358,7 @@ impl ServerResponse {
                     let mut enc_length = self.variant_encode(ct.len());
                     enc_response.append(&mut enc_length);
                     enc_response.append(&mut ct);
-                    info!("Encapsulated final chunk {}({})", hex::encode(&enc_response), enc_response.len());
+                    info!("Encapsulated final chunk {}({},{})", hex::encode(&enc_response), ct.len(), enc_response.len());
                     yield Ok(enc_response);
                     return;
                 }
@@ -468,7 +471,7 @@ impl ClientResponse {
         let output_stream = stream! {
             while let Some(next) = stream.next().await {
                 let mut enc_response = next.unwrap();
-                info!("Recevied chunk: {}({})", hex::encode(&enc_response), enc_response.len());
+                info!("Received chunk: {}({})", hex::encode(&enc_response), enc_response.len());
                 buffer.append(&mut enc_response);
                 info!("Buffer size {}", buffer.len());
 
@@ -480,26 +483,31 @@ impl ClientResponse {
                     self.set_response_nonce(&nonce).unwrap();
                 }
 
-                if !buffer.is_empty() {
-                    let (mut len, bytes_read) = self.variant_decode(&buffer).unwrap();
+                while nonce_received && !buffer.is_empty() {
+                    let (mut len, mut bytes_read) = self.variant_decode(&buffer).unwrap();
                     info!("Buffer state: {}, {}({})", buffer.len(), len, bytes_read);
 
+                    // Final Response Chunk Indicator (i) = 0,
                     if len == 0 {
                         buffer.drain(0..bytes_read);
                         info!("Processing final chunk");
-                        // Final Response Chunk Indicator (i) = 0,
                         aad = "final";
-                        let (length, bytes_read) = self.variant_decode(&buffer).unwrap();
-                        info!("Buffer state: {}, {}({})", buffer.len(), length, bytes_read);
+                        let (length, bytes) = self.variant_decode(&buffer).unwrap();
+                        info!("Buffer state: {}({})", length, bytes_read);
                         len = length;
+                        bytes_read = bytes;
                     }
 
-                    if buffer.len() >= (len as usize){
+                    // Decapsulate chunk if received
+                    let len = usize::try_from(len).unwrap();
+                    if buffer.len() >= len {
                         buffer.drain(0..bytes_read);
-                        let ct: Vec<_> = buffer.drain(0..(len as usize)).collect();
+                        let ct: Vec<_> = buffer.drain(0..len).collect();
                         info!("Decapsulating chunk {}({})", hex::encode(&ct), len);
                         self.seq += 1;
                         yield self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &ct);
+                    } else {
+                        break;
                     }
                 }
             }
@@ -517,8 +525,12 @@ mod test {
         hpke::{Aead, Kdf, Kem},
         ClientRequest, Error, KeyConfig, KeyId, Server,
     };
+
+    use futures::StreamExt;
     use log::trace;
     use std::{fmt::Debug, io::ErrorKind};
+
+    use async_stream::stream;
 
     const KEY_ID: KeyId = 1;
     const KEM: Kem = Kem::X25519Sha256;
@@ -718,5 +730,197 @@ mod test {
 
         let response = client_response.decapsulate(&enc_response).unwrap();
         assert_eq!(&response[..], RESPONSE);
+    }
+
+    #[tokio::test]
+    async fn response_stream() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! { yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec()); };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let mut response = client_response.decapsulate_stream(enc_response).await;
+        let next = response.next().await;
+        assert!(next.is_some_and(|x| x.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE))));
+    }
+
+    #[tokio::test]
+    async fn two_response_stream() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! {
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+        };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let mut response = client_response.decapsulate_stream(enc_response).await;
+        let next = response.next().await;
+        assert!(next.is_some_and(|x| x.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE))));
+
+        let next = response.next().await;
+        assert!(next.is_some_and(|x| x.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE))));
+    }
+
+    #[tokio::test]
+    async fn two_response_stream_merged() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! {
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+        };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let merged_response = enc_response.chunks(2).map(|chunk| {
+            if chunk.len() == 2 {
+                println!("Found too elements");
+                let mut first = chunk[0].as_ref().unwrap().clone();
+                let second = chunk[1].as_ref().unwrap();
+                first.append(&mut second.clone());
+                Ok::<Vec<u8>, Error>(first.clone())
+            } else {
+                Ok::<Vec<u8>, Error>(chunk[0].as_ref().unwrap().clone())
+            }
+        });
+
+        let mut response = client_response.decapsulate_stream(merged_response).await;
+
+        let mut count = 0;
+        while let Some(next) = response.next().await {
+            count += 1;
+            assert!(next.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE)));
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn three_response_stream_merged() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! {
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+        };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let merged_response = enc_response.chunks(2).map(|chunk| {
+            if chunk.len() == 2 {
+                let mut first = chunk[0].as_ref().unwrap().clone();
+                let second = chunk[1].as_ref().unwrap();
+                first.append(&mut second.clone());
+                Ok::<Vec<u8>, Error>(first.clone())
+            } else {
+                Ok::<Vec<u8>, Error>(chunk[0].as_ref().unwrap().clone())
+            }
+        });
+
+        let mut response = client_response.decapsulate_stream(merged_response).await;
+        let mut count = 0;
+        while let Some(next) = response.next().await {
+            count += 1;
+            assert!(next.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE)));
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn response_stream_fragment() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! { yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec()); };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let fragmented_response = enc_response.flat_map(|chunk| {
+            let c = chunk.unwrap();
+            if c.len() % 4 == 0 {
+                let chunks: Vec<_> = c
+                    .chunks(4)
+                    .map(|c| Ok::<Vec<u8>, Error>(c.to_vec()))
+                    .collect();
+                futures_util::stream::iter(chunks)
+            } else if c.len() % 3 == 0 {
+                let chunks: Vec<_> = c
+                    .chunks(3)
+                    .map(|c| Ok::<Vec<u8>, Error>(c.to_vec()))
+                    .collect();
+                futures_util::stream::iter(chunks)
+            } else {
+                let vec = vec![Ok::<Vec<u8>, Error>(c)];
+                futures_util::stream::iter(vec)
+            }
+        });
+
+        let mut response = client_response
+            .decapsulate_stream(fragmented_response)
+            .await;
+        let next = response.next().await;
+        assert!(next.is_some_and(|x| x.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE))));
     }
 }

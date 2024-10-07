@@ -13,7 +13,7 @@ use ::hpke_pq as rust_hpke;
 use rust_hpke::{
     aead::{AeadCtxR, AeadCtxS, AeadTag, AesGcm128, AesGcm256, ChaCha20Poly1305},
     kdf::{HkdfSha256, HkdfSha384},
-    kem::{Kem as KemTrait, X25519HkdfSha256, DhP384HkdfSha384},
+    kem::{DhP384HkdfSha384, Kem as KemTrait, X25519HkdfSha256},
     setup_receiver, setup_sender, Deserializable, OpModeR, OpModeS, Serializable,
 };
 
@@ -51,7 +51,11 @@ impl Config {
 
     pub fn supported(self) -> bool {
         // TODO support more options
-        matches!(self.kdf, Kdf::HkdfSha256 | Kdf::HkdfSha384) && matches!(self.aead, Aead::Aes128Gcm | Aead::Aes256Gcm | Aead::ChaCha20Poly1305)
+        matches!(self.kdf, Kdf::HkdfSha256 | Kdf::HkdfSha384)
+            && matches!(
+                self.aead,
+                Aead::Aes128Gcm | Aead::Aes256Gcm | Aead::ChaCha20Poly1305
+            )
     }
 }
 

@@ -81,7 +81,13 @@ impl KeyConfig {
     /// Construct a configuration from an existing private key
     /// # Panics
     /// If the configurations don't include a supported configuration.
-    pub fn import_p384(key_id: u8, kem: Kem, sk: <hpke::kem::DhP384HkdfSha384 as hpke::Kem>::PrivateKey, pk: <hpke::kem::DhP384HkdfSha384 as hpke::Kem>::PublicKey, mut symmetric: Vec<SymmetricSuite>) -> Res<Self> {
+    pub fn import_p384(
+        key_id: u8,
+        kem: Kem,
+        sk: <hpke::kem::DhP384HkdfSha384 as hpke::Kem>::PrivateKey,
+        pk: <hpke::kem::DhP384HkdfSha384 as hpke::Kem>::PublicKey,
+        mut symmetric: Vec<SymmetricSuite>,
+    ) -> Res<Self> {
         Self::strip_unsupported(&mut symmetric, kem);
         assert!(!symmetric.is_empty());
         Ok(Self {
