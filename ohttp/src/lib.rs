@@ -28,13 +28,13 @@ use crate::{
     hpke::{Aead as AeadId, Kdf, Kem},
 };
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use log::{info, trace};
 use std::{
     cmp::max,
     convert::TryFrom,
     io::{BufReader, Read},
     mem::size_of,
 };
+use tracing::{info, trace};
 
 #[cfg(feature = "nss")]
 use crate::nss::random;
@@ -316,8 +316,9 @@ impl ServerResponse {
         // Response Nonce (Nk)
         let response_nonce = Ok(self.response_nonce.clone());
         info!(
-            "Response nonce {}",
-            hex::encode(self.response_nonce.clone())
+            "Response nonce {}({})",
+            hex::encode(&self.response_nonce.clone()),
+            self.response_nonce.len()
         );
         let nonce_stream = once(async { response_nonce });
 
@@ -342,7 +343,9 @@ impl ServerResponse {
                     // AEAD-Protected Chunk (..),
                     enc_response.append(&mut ct);
 
-                    info!("Encapsulated chunk {}({},{})", hex::encode(&enc_response), ct.len(), enc_response.len());
+                    info!("Encapsulated chunk ({},{})", ct.len(), enc_response.len());
+                    trace!("{}", hex::encode(&enc_response));
+
                     yield Ok(enc_response);
                     current = next.unwrap();
                 } else {
@@ -358,7 +361,9 @@ impl ServerResponse {
                     let mut enc_length = self.variant_encode(ct.len());
                     enc_response.append(&mut enc_length);
                     enc_response.append(&mut ct);
-                    info!("Encapsulated final chunk {}({},{})", hex::encode(&enc_response), ct.len(), enc_response.len());
+
+                    info!("Encapsulated final chunk ({},{})", ct.len(), enc_response.len());
+                    trace!("{}", hex::encode(&enc_response));
                     yield Ok(enc_response);
                     return;
                 }
@@ -471,7 +476,8 @@ impl ClientResponse {
         let output_stream = stream! {
             while let Some(next) = stream.next().await {
                 let mut enc_response = next.unwrap();
-                info!("Received chunk: {}({})", hex::encode(&enc_response), enc_response.len());
+                info!("Received chunk: ({})", enc_response.len());
+                trace!("{}", hex::encode(&enc_response));
                 buffer.append(&mut enc_response);
                 info!("Buffer size {}", buffer.len());
 
@@ -503,7 +509,8 @@ impl ClientResponse {
                     if buffer.len() >= len {
                         buffer.drain(0..bytes_read);
                         let ct: Vec<_> = buffer.drain(0..len).collect();
-                        info!("Decapsulating chunk {}({})", hex::encode(&ct), len);
+                        info!("Decapsulating chunk ({})", len);
+                        trace!("{}", hex::encode(&ct));
                         self.seq += 1;
                         yield self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &ct);
                     } else {
@@ -531,7 +538,6 @@ mod test {
     use std::{fmt::Debug, io::ErrorKind};
 
     use async_stream::stream;
-
     const KEY_ID: KeyId = 1;
     const KEM: Kem = Kem::X25519Sha256;
     const SYMMETRIC: &[SymmetricSuite] = &[
@@ -547,7 +553,6 @@ mod test {
 
     fn init() {
         crate::init();
-        _ = env_logger::try_init(); // ignore errors here
     }
 
     #[test]
