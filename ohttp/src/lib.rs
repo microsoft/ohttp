@@ -317,7 +317,7 @@ impl ServerResponse {
         let response_nonce = Ok(self.response_nonce.clone());
         info!(
             "Response nonce {}({})",
-            hex::encode(&self.response_nonce.clone()),
+            hex::encode(self.response_nonce.clone()),
             self.response_nonce.len()
         );
         let nonce_stream = once(async { response_nonce });
@@ -534,8 +534,8 @@ mod test {
     };
 
     use futures::StreamExt;
-    use log::trace;
     use std::{fmt::Debug, io::ErrorKind};
+    use tracing::trace;
 
     use async_stream::stream;
     const KEY_ID: KeyId = 1;

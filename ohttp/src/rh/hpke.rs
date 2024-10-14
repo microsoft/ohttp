@@ -21,8 +21,8 @@ use rust_hpke::{
 use rust_hpke::kem::X25519Kyber768Draft00;
 
 use ::rand::thread_rng;
-use log::trace;
 use std::ops::Deref;
+use tracing::trace;
 
 /// Configuration for `Hpke`.
 #[derive(Clone, Copy)]

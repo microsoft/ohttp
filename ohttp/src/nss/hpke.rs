@@ -4,13 +4,13 @@ use super::{
     p11::{sys, Item, PrivateKey, PublicKey, Slot, SymKey},
 };
 use crate::err::Res;
-use log::{log_enabled, trace};
 use std::{
     convert::TryFrom,
     ops::Deref,
     os::raw::c_uint,
     ptr::{addr_of_mut, null, null_mut},
 };
+use tracing::{log_enabled, trace};
 
 pub use sys::{HpkeAeadId as AeadId, HpkeKdfId as KdfId, HpkeKemId as KemId};
 
@@ -250,7 +250,7 @@ pub fn generate_key_pair(kem: Kem) -> Res<(PrivateKey, PublicKey)> {
     let mut wrapped = Item::wrap(&params);
 
     // Try to make an insensitive key so that we can read the key data for tracing.
-    let insensitive_secret_ptr = if log_enabled!(log::Level::Trace) {
+    let insensitive_secret_ptr = if log_enabled!(tracing::Level::Trace) {
         unsafe {
             sys::PK11_GenerateKeyPairWithOpFlags(
                 *slot,

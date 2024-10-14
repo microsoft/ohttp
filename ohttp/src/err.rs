@@ -16,6 +16,20 @@ pub enum Error {
     #[cfg(all(feature = "rust-hpke", feature = "pq"))]
     #[error("a problem occurred with HPKE: {0}")]
     Hpke(#[from] ::hpke_pq::HpkeError),
+    #[error("Incorrect CBOR encoding in returned private key")]
+    KMSCBOREncoding,
+    #[error("Bad CBOR key type, expected P-384(2)")]
+    KMSCBORKeyType,
+    #[error("Unexpected field in exported private key from KMS")]
+    KMSField,
+    #[error("the key ID was invalid")]
+    KMSKeyId,
+    #[error("Missing private exponent in key returned from KMS")]
+    KMSPrivateExponent,
+    #[error("Invalid private key")]
+    KMSPrivateKey,
+    #[error("Max retries reached, giving up. Cannot reach key management service")]
+    KMSUnreachable,
     #[error("an internal error occurred")]
     Internal,
     #[error("the wrong type of key was provided for the selected KEM")]
@@ -26,6 +40,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("the key ID was invalid")]
     KeyId,
+    #[error("Failed to get MAA token. You must be root to access TPM")]
+    MAAToken,
     #[error("a field was truncated")]
     Truncated,
     #[error("the configuration was not supported")]

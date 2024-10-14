@@ -10,8 +10,8 @@ use super::{
     },
 };
 use crate::err::Res;
-use log::trace;
 use std::{convert::TryFrom, os::raw::c_int, ptr::null_mut};
+use tracing::trace;
 
 #[derive(Clone, Copy)]
 pub enum KeyMechanism {
