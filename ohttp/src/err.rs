@@ -5,6 +5,8 @@ pub enum Error {
     #[cfg(feature = "rust-hpke")]
     #[error("a problem occurred with the AEAD")]
     Aead(#[from] aead::Error),
+    #[error("Failed to convert endpoint URL to CString")]
+    Attest,
     #[cfg(feature = "nss")]
     #[error("a problem occurred during cryptographic processing: {0}")]
     Crypto(#[from] crate::nss::Error),
@@ -22,12 +24,16 @@ pub enum Error {
     KMSCBORKeyType,
     #[error("Unexpected field in exported private key from KMS")]
     KMSField,
-    #[error("the key ID was invalid")]
+    #[error("Bad key identifier in SKR response")]
     KMSKeyId,
-    #[error("Missing private exponent in key returned from KMS")]
-    KMSPrivateExponent,
+    #[error("KMS returned a different key ID from the one requested : {0} {1}")]
+    KMSKeyIdMismatch(u8, u8),
+    #[error("Invalid secret exponent in SKR response")]
+    KMSExponent,
     #[error("Invalid private key")]
     KMSPrivateKey,
+    #[error("KMS returned an unexpected status code: {0}")]
+    KMSUnexpected(u16),
     #[error("Max retries reached, giving up. Cannot reach key management service")]
     KMSUnreachable,
     #[error("an internal error occurred")]
@@ -40,8 +46,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("the key ID was invalid")]
     KeyId,
-    #[error("Failed to get MAA token. You must be root to access TPM")]
-    MAAToken,
+    #[error("CVM guest attestation library returned error: {0}")]
+    MAAToken(i32),
     #[error("a field was truncated")]
     Truncated,
     #[error("the configuration was not supported")]
