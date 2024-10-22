@@ -234,7 +234,9 @@ impl Deref for HpkeR {
 
 /// Generate a key pair for the identified KEM.
 pub fn generate_key_pair(kem: Kem) -> Res<(PrivateKey, PublicKey)> {
-    assert_eq!(kem, Kem::X25519Sha256);
+    if kem != Kem::X25519Sha256 {
+        return Err(Error::InvalidKem);
+    }
     let slot = Slot::internal()?;
 
     let oid_data = unsafe { sys::SECOID_FindOIDByTag(sys::SECOidTag::SEC_OID_CURVE25519) };
@@ -266,7 +268,10 @@ pub fn generate_key_pair(kem: Kem) -> Res<(PrivateKey, PublicKey)> {
     } else {
         null_mut()
     };
-    assert_eq!(insensitive_secret_ptr.is_null(), public_ptr.is_null());
+    if insensitive_secret_ptr.is_null() == public_ptr.is_null() {
+        return Error::unexpected;
+    }
+
     let secret_ptr = if insensitive_secret_ptr.is_null() {
         unsafe {
             sys::PK11_GenerateKeyPairWithOpFlags(
@@ -283,7 +288,10 @@ pub fn generate_key_pair(kem: Kem) -> Res<(PrivateKey, PublicKey)> {
     } else {
         insensitive_secret_ptr
     };
-    assert_eq!(secret_ptr.is_null(), public_ptr.is_null());
+    if secret_ptr.is_null() == public_ptr.is_null() {
+        return Error::unexpected;
+    }
+
     let sk = PrivateKey::from_ptr(secret_ptr)?;
     let pk = PublicKey::from_ptr(public_ptr)?;
     trace!("Generated key pair: sk={:?} pk={:?}", sk, pk);

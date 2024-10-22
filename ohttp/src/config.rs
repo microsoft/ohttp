@@ -63,11 +63,12 @@ impl KeyConfig {
     }
 
     /// Construct a configuration for the server side.
-    /// # Panics
     /// If the configurations don't include a supported configuration.
     pub fn new(key_id: u8, kem: Kem, mut symmetric: Vec<SymmetricSuite>) -> Res<Self> {
         Self::strip_unsupported(&mut symmetric, kem);
-        assert!(!symmetric.is_empty());
+        if symmetric.is_empty() {
+            return Err(Error::SymmetricKeyEmpty);
+        }
         let (sk, pk) = generate_key_pair(kem)?;
         Ok(Self {
             key_id,
@@ -89,7 +90,9 @@ impl KeyConfig {
         mut symmetric: Vec<SymmetricSuite>,
     ) -> Res<Self> {
         Self::strip_unsupported(&mut symmetric, kem);
-        assert!(!symmetric.is_empty());
+        if symmetric.is_empty() {
+            return Err(Error::SymmetricKeyEmpty);
+        }
         Ok(Self {
             key_id,
             kem,
@@ -114,7 +117,9 @@ impl KeyConfig {
         #[cfg(feature = "rust-hpke")]
         {
             Self::strip_unsupported(&mut symmetric, kem);
-            assert!(!symmetric.is_empty());
+            if symmetric.is_empty() {
+                return Err(Error::SymmetricKeyEmpty);
+            }
             let (sk, pk) = derive_key_pair(kem, ikm)?;
             Ok(Self {
                 key_id,

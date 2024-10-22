@@ -124,7 +124,9 @@ impl Aead {
     }
 
     pub fn seal(&mut self, aad: &[u8], pt: &[u8]) -> Res<Vec<u8>> {
-        assert_eq!(self.mode, Mode::Encrypt);
+        if self.mode != Mode::Encrypt {
+            return Err(Error::AeadMode);
+        }
         // A copy for the nonce generator to write into.  But we don't use the value.
         let mut nonce = self.nonce_base;
         // Ciphertext with enough space for the tag.
@@ -152,13 +154,20 @@ impl Aead {
             )
         })?;
         ct.truncate(usize::try_from(ct_len).unwrap());
-        debug_assert_eq!(ct.len(), pt.len());
+
+        ct_len = ct.len();
+        let pt_len = pt.len();
+        if ct_len != pt_len {
+            return Err(Error::UnequalLength(ct_len, pt_len));
+        }
         ct.append(&mut tag);
         Ok(ct)
     }
 
     pub fn open(&mut self, aad: &[u8], seq: SequenceNumber, ct: &[u8]) -> Res<Vec<u8>> {
-        assert_eq!(self.mode, Mode::Decrypt);
+        if self.mode != Mode::Decrypt {
+            return Err(Error::AeadMode);
+        }
         let mut nonce = self.nonce_base;
         for (i, n) in nonce.iter_mut().rev().take(COUNTER_LEN).enumerate() {
             *n ^= u8::try_from((seq >> (8 * i)) & 0xff).unwrap();
@@ -185,7 +194,9 @@ impl Aead {
             )
         })?;
         let len = usize::try_from(pt_len).unwrap();
-        debug_assert_eq!(len, pt_expected);
+        if len != pt_expected {
+            return Err(Error::UnequalLength(len, pt_expected));
+        }
         pt.truncate(len);
         Ok(pt)
     }

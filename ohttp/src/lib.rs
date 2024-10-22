@@ -104,7 +104,10 @@ impl ClientRequest {
         let hpke = HpkeS::new(selected, &mut config.pk, &info)?;
 
         let header = Vec::from(&info[INFO_REQUEST.len() + 1..]);
-        debug_assert_eq!(header.len(), REQUEST_HEADER_LEN);
+        let header_len = header.len();
+        if header_len != REQUEST_HEADER_LEN {
+            return Err(Error::UnequalLength(header_len, REQUEST_HEADER_LEN));
+        }
         Ok(Self { hpke, header })
     }
 
@@ -143,7 +146,10 @@ impl ClientRequest {
         let mut ct = self.hpke.seal(&[], request)?;
         enc_request.append(&mut ct);
 
-        debug_assert_eq!(expected_len, enc_request.len());
+        let enc_request_len = enc_request.len();
+        if expected_len != enc_request_len {
+            return Err(Error::UnequalLength(expected_len, enc_request_len));
+        }
         Ok((enc_request, ClientResponse::new(self.hpke, enc)))
     }
 }
@@ -160,10 +166,11 @@ pub struct Server {
 #[cfg(feature = "server")]
 impl Server {
     /// Create a new server configuration.
-    /// # Panics
     /// If the configuration doesn't include a private key.
     pub fn new(config: KeyConfig) -> Res<Self> {
-        assert!(config.sk.is_some());
+        if config.sk.is_none() {
+            return Err(Error::InvalidPrivateKey);
+        }
         Ok(Self { config })
     }
 
@@ -174,7 +181,6 @@ impl Server {
     }
 
     /// Remove encapsulation on a message.
-    /// # Panics
     /// Not as a consequence of this code, but Rust won't know that for sure.
     #[allow(clippy::similar_names)] // for kem_id and key_id
     pub fn decapsulate(&self, enc_request: &[u8]) -> Res<(Vec<u8>, ServerResponse)> {
@@ -184,7 +190,7 @@ impl Server {
         let mut r = BufReader::new(enc_request);
         let key_id = r.read_u8()?;
         if key_id != self.config.key_id {
-            return Err(Error::KeyId);
+            return Err(Error::KeyIdMismatch(key_id, self.config.key_id));
         }
         let kem_id = Kem::try_from(r.read_u16::<NetworkEndian>()?)?;
         if kem_id != self.config.kem {
