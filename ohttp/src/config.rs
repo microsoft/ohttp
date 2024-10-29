@@ -63,11 +63,12 @@ impl KeyConfig {
     }
 
     /// Construct a configuration for the server side.
-    /// # Panics
     /// If the configurations don't include a supported configuration.
     pub fn new(key_id: u8, kem: Kem, mut symmetric: Vec<SymmetricSuite>) -> Res<Self> {
         Self::strip_unsupported(&mut symmetric, kem);
-        assert!(!symmetric.is_empty());
+        if symmetric.is_empty() {
+            return Err(Error::SymmetricKeyEmpty);
+        }
         let (sk, pk) = generate_key_pair(kem)?;
         Ok(Self {
             key_id,
@@ -75,6 +76,29 @@ impl KeyConfig {
             symmetric,
             sk: Some(sk),
             pk,
+        })
+    }
+
+    /// Construct a configuration from an existing private key
+    /// # Panics
+    /// If the configurations don't include a supported configuration.
+    pub fn import_p384(
+        key_id: u8,
+        kem: Kem,
+        sk: <hpke::kem::DhP384HkdfSha384 as hpke::Kem>::PrivateKey,
+        pk: <hpke::kem::DhP384HkdfSha384 as hpke::Kem>::PublicKey,
+        mut symmetric: Vec<SymmetricSuite>,
+    ) -> Res<Self> {
+        Self::strip_unsupported(&mut symmetric, kem);
+        if symmetric.is_empty() {
+            return Err(Error::SymmetricKeyEmpty);
+        }
+        Ok(Self {
+            key_id,
+            kem,
+            symmetric,
+            sk: Some(crate::rh::hpke::PrivateKey::P384(sk)),
+            pk: crate::rh::hpke::PublicKey::P384(pk),
         })
     }
 
@@ -93,7 +117,9 @@ impl KeyConfig {
         #[cfg(feature = "rust-hpke")]
         {
             Self::strip_unsupported(&mut symmetric, kem);
-            assert!(!symmetric.is_empty());
+            if symmetric.is_empty() {
+                return Err(Error::SymmetricKeyEmpty);
+            }
             let (sk, pk) = derive_key_pair(kem, ikm)?;
             Ok(Self {
                 key_id,

@@ -109,7 +109,9 @@ impl Clone for PrivateKey {
     #[must_use]
     fn clone(&self) -> Self {
         let ptr = unsafe { sys::SECKEY_CopyPrivateKey(self.ptr) };
-        assert!(!ptr.is_null());
+        if ptr.is_null() {
+            return Error::unexpected;
+        }
         Self { ptr }
     }
 }
@@ -150,7 +152,9 @@ impl Clone for PublicKey {
     #[must_use]
     fn clone(&self) -> Self {
         let ptr = unsafe { sys::SECKEY_CopyPublicKey(self.ptr) };
-        assert!(!ptr.is_null());
+        if ptr.is_null() {
+            return Error::unexpected;
+        }
         Self { ptr }
     }
 }
@@ -198,7 +202,9 @@ impl Clone for SymKey {
     #[must_use]
     fn clone(&self) -> Self {
         let ptr = unsafe { PK11_ReferenceSymKey(self.ptr) };
-        assert!(!ptr.is_null());
+        if ptr.is_null() {
+            return Error::unexpected;
+        }
         Self { ptr }
     }
 }
@@ -274,7 +280,9 @@ impl Item {
     pub(crate) unsafe fn into_vec(self) -> Vec<u8> {
         let b = self.ptr.as_ref().unwrap();
         // Sanity check the type, as some types don't count bytes in `Item::len`.
-        assert_eq!(b.type_, SECItemType::siBuffer);
+        if b.type_ != SECItemType::siBuffer {
+            return Error::unexpected;
+        }
         let slc = std::slice::from_raw_parts(b.data, usize::try_from(b.len).unwrap());
         Vec::from(slc)
     }
