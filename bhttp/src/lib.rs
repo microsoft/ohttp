@@ -681,7 +681,9 @@ impl Message {
             }
             let mut buf = vec![0; count];
             r.borrow_mut().read_exact(&mut buf)?;
-            assert!(read_line(r)?.is_empty());
+            if !read_line(r)?.is_empty() {
+                return Err(Error::InvalidChunkEnd);
+            }
             content.append(&mut buf);
         }
     }
@@ -781,7 +783,9 @@ impl Message {
         let mode = match t {
             0 | 1 => Mode::KnownLength,
             2 | 3 => Mode::IndeterminateLength,
-            _ => return Err(Error::InvalidMode),
+            _ => {
+                return Err(Error::InvalidMode);
+            }
         };
 
         let mut control = ControlData::read_bhttp(request, r)?;

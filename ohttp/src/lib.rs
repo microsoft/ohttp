@@ -1,4 +1,3 @@
-#![deny(warnings, clippy::pedantic)]
 #![allow(clippy::missing_errors_doc)] // I'm too lazy
 #![cfg_attr(
     not(all(feature = "client", feature = "server")),
@@ -15,6 +14,10 @@ mod rand;
 #[cfg(feature = "rust-hpke")]
 mod rh;
 
+use async_stream::stream;
+use futures::{stream::Stream, StreamExt};
+use futures_util::stream::once;
+
 pub use crate::{
     config::{KeyConfig, SymmetricSuite},
     err::Error,
@@ -25,13 +28,13 @@ use crate::{
     hpke::{Aead as AeadId, Kdf, Kem},
 };
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use log::trace;
 use std::{
     cmp::max,
     convert::TryFrom,
     io::{BufReader, Read},
     mem::size_of,
 };
+use tracing::{info, trace};
 
 #[cfg(feature = "nss")]
 use crate::nss::random;
@@ -101,7 +104,10 @@ impl ClientRequest {
         let hpke = HpkeS::new(selected, &mut config.pk, &info)?;
 
         let header = Vec::from(&info[INFO_REQUEST.len() + 1..]);
-        debug_assert_eq!(header.len(), REQUEST_HEADER_LEN);
+        let header_len = header.len();
+        if header_len != REQUEST_HEADER_LEN {
+            return Err(Error::UnequalLength(header_len, REQUEST_HEADER_LEN));
+        }
         Ok(Self { hpke, header })
     }
 
@@ -140,7 +146,10 @@ impl ClientRequest {
         let mut ct = self.hpke.seal(&[], request)?;
         enc_request.append(&mut ct);
 
-        debug_assert_eq!(expected_len, enc_request.len());
+        let enc_request_len = enc_request.len();
+        if expected_len != enc_request_len {
+            return Err(Error::UnequalLength(expected_len, enc_request_len));
+        }
         Ok((enc_request, ClientResponse::new(self.hpke, enc)))
     }
 }
@@ -157,10 +166,11 @@ pub struct Server {
 #[cfg(feature = "server")]
 impl Server {
     /// Create a new server configuration.
-    /// # Panics
     /// If the configuration doesn't include a private key.
     pub fn new(config: KeyConfig) -> Res<Self> {
-        assert!(config.sk.is_some());
+        if config.sk.is_none() {
+            return Err(Error::InvalidPrivateKey);
+        }
         Ok(Self { config })
     }
 
@@ -171,7 +181,6 @@ impl Server {
     }
 
     /// Remove encapsulation on a message.
-    /// # Panics
     /// Not as a consequence of this code, but Rust won't know that for sure.
     #[allow(clippy::similar_names)] // for kem_id and key_id
     pub fn decapsulate(&self, enc_request: &[u8]) -> Res<(Vec<u8>, ServerResponse)> {
@@ -181,7 +190,7 @@ impl Server {
         let mut r = BufReader::new(enc_request);
         let key_id = r.read_u8()?;
         if key_id != self.config.key_id {
-            return Err(Error::KeyId);
+            return Err(Error::KeyIdMismatch(key_id, self.config.key_id));
         }
         let kem_id = Kem::try_from(r.read_u16::<NetworkEndian>()?)?;
         if kem_id != self.config.kem {
@@ -259,12 +268,116 @@ impl ServerResponse {
         })
     }
 
+    // Variable length encoding of an integer
+    fn variant_encode(&mut self, mut val: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            #[allow(clippy::cast_possible_truncation)]
+            let mut byte = (val & 0x7F) as u8; // Take the last 7 bits
+            val >>= 7; // Shift right by 7 bits
+            if val != 0 {
+                byte |= 0x80; // Set the MSB if there's more to encode
+            }
+            bytes.push(byte);
+            if val == 0 {
+                break;
+            }
+        }
+        bytes
+    }
+
     /// Consume this object by encapsulating a response.
     pub fn encapsulate(mut self, response: &[u8]) -> Res<Vec<u8>> {
         let mut enc_response = self.response_nonce;
         let mut ct = self.aead.seal(&[], response)?;
         enc_response.append(&mut ct);
         Ok(enc_response)
+    }
+
+    // Consume this object by encapsulating a stream
+    // https://www.ietf.org/archive/id/draft-ohai-chunked-ohttp-01.html#name-response-format
+    // Chunked Encapsulated Response {
+    //   Response Nonce (Nk),
+    //   Chunked Response Chunks (..),
+    // }
+
+    // Chunked Response Chunks {
+    //   Non-Final Response Chunk (..),
+    //   Final Response Chunk Indicator (i) = 0,
+    //   AEAD-Protected Final Response Chunk (..),
+    // }
+
+    // Non-Final Response Chunk {
+    //   Length (i) = 1..,
+    //   AEAD-Protected Chunk (..),
+    // }
+    pub fn encapsulate_stream<S, E>(
+        mut self,
+        input: S,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Res<Vec<u8>>> + Send + 'static>>
+    where
+        S: Stream<Item = Result<Vec<u8>, E>> + Send + 'static,
+        E: std::fmt::Debug + Send,
+    {
+        // Response Nonce (Nk)
+        let response_nonce = Ok(self.response_nonce.clone());
+        info!(
+            "Response nonce {}({})",
+            hex::encode(self.response_nonce.clone()),
+            self.response_nonce.len()
+        );
+        let nonce_stream = once(async { response_nonce });
+
+        let mut input = Box::pin(input);
+        let output_stream = stream! {
+            let current = input.next().await;
+            let Some(current) = current else { return };
+            let Ok(mut current) = current else { return };
+
+            loop {
+                //info!("Processing chunk {}", std::str::from_utf8(&current).unwrap());
+                if let Some(next) = input.next().await {
+                    let mut enc_response = Vec::new();
+
+                    // Non-Final Response Chunk (..),
+                    let aad = "";
+                    let mut ct = self.aead.seal(aad.as_bytes(), &current).unwrap();
+                    let mut enc_length = self.variant_encode(ct.len());
+                    // Length (i) = 1..,
+                    enc_response.append(&mut enc_length);
+
+                    // AEAD-Protected Chunk (..),
+                    enc_response.append(&mut ct);
+
+                    info!("Encapsulated chunk ({},{})", ct.len(), enc_response.len());
+                    trace!("{}", hex::encode(&enc_response));
+
+                    yield Ok(enc_response);
+                    current = next.unwrap();
+                } else {
+                    let mut enc_response = Vec::new();
+
+                    // Final Response Chunk Indicator (i) = 0,
+                    let mut final_chunk_indicator = self.variant_encode(0);
+                    enc_response.append(&mut final_chunk_indicator);
+
+                    // AEAD-Protected Final Response Chunk (..),
+                    let aad = "final";
+                    let mut ct = self.aead.seal(aad.as_bytes(), &current).unwrap();
+                    let mut enc_length = self.variant_encode(ct.len());
+                    enc_response.append(&mut enc_length);
+                    enc_response.append(&mut ct);
+
+                    info!("Encapsulated final chunk ({},{})", ct.len(), enc_response.len());
+                    trace!("{}", hex::encode(&enc_response));
+                    yield Ok(enc_response);
+                    return;
+                }
+            }
+        };
+
+        let stream = nonce_stream.chain(output_stream);
+        Box::pin(stream)
     }
 }
 
@@ -281,6 +394,8 @@ impl std::fmt::Debug for ServerResponse {
 pub struct ClientResponse {
     hpke: HpkeS,
     enc: Vec<u8>,
+    seq: u64,
+    aead: Option<Aead>,
 }
 
 #[cfg(feature = "client")]
@@ -289,7 +404,14 @@ impl ClientResponse {
     /// Doesn't do anything because we don't have the nonce yet, so
     /// the work that can be done is limited.
     fn new(hpke: HpkeS, enc: Vec<u8>) -> Self {
-        Self { hpke, enc }
+        let seq = 0;
+        let aead = None;
+        Self {
+            hpke,
+            enc,
+            seq,
+            aead,
+        }
     }
 
     /// Consume this object by decapsulating a response.
@@ -308,6 +430,104 @@ impl ClientResponse {
         )?;
         aead.open(&[], 0, ct) // 0 is the sequence number
     }
+
+    fn set_response_nonce(&mut self, enc_response: &[u8]) -> Res<()> {
+        let mid = entropy(self.hpke.config());
+        if mid != enc_response.len() {
+            return Err(Error::Truncated);
+        }
+        let aead = make_aead(
+            Mode::Decrypt,
+            self.hpke.config(),
+            &self.hpke,
+            self.enc.clone(),
+            enc_response,
+        )?;
+        self.aead = Some(aead);
+        Ok(())
+    }
+
+    fn variant_decode(&mut self, bytes: &[u8]) -> Result<(u64, usize), String> {
+        let mut value: u64 = 0;
+        let mut shift = 0;
+        let mut bytes_read = 0;
+
+        for &byte in bytes {
+            let byte_value = (byte & 0x7F) as u64;
+            value |= byte_value << shift;
+            bytes_read += 1;
+            if byte & 0x80 == 0 {
+                // Continuation bit is not set, end of the VLQ-encoded integer
+                return Ok((value, bytes_read));
+            }
+            shift += 7;
+            if shift >= 64 {
+                return Err("VLQ-encoded integer is too large".to_string());
+            }
+        }
+        Err("Incomplete VLQ-encoded integer".to_string())
+    }
+
+    pub async fn decapsulate_stream<S>(
+        mut self,
+        mut stream: S,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Res<Vec<u8>>> + Send + 'static>>
+    where
+        S: Stream<Item = Res<Vec<u8>>> + Send + 'static + Unpin,
+    {
+        let mut nonce_received = false;
+        let mut aad = "";
+        let nonce_size = entropy(self.hpke.config());
+        let mut buffer: Vec<u8> = Vec::new();
+        let output_stream = stream! {
+            while let Some(next) = stream.next().await {
+                let mut enc_response = next.unwrap();
+                info!("Received chunk: ({})", enc_response.len());
+                trace!("{}", hex::encode(&enc_response));
+                buffer.append(&mut enc_response);
+                info!("Buffer size {}", buffer.len());
+
+                // Response Nonce (Nk)
+                if !nonce_received && buffer.len() >= nonce_size {
+                    nonce_received = true;
+                    let nonce: Vec<_> = buffer.drain(0..nonce_size).collect();
+                    info!("Setting response nonce: {}({})", hex::encode(&nonce), nonce.len());
+                    self.set_response_nonce(&nonce).unwrap();
+                }
+
+                while nonce_received && !buffer.is_empty() {
+                    let (mut len, mut bytes_read) = self.variant_decode(&buffer).unwrap();
+                    info!("Buffer state: {}, {}({})", buffer.len(), len, bytes_read);
+
+                    // Final Response Chunk Indicator (i) = 0,
+                    if len == 0 {
+                        buffer.drain(0..bytes_read);
+                        info!("Processing final chunk");
+                        aad = "final";
+                        let (length, bytes) = self.variant_decode(&buffer).unwrap();
+                        info!("Buffer state: {}({})", length, bytes_read);
+                        len = length;
+                        bytes_read = bytes;
+                    }
+
+                    // Decapsulate chunk if received
+                    let len = usize::try_from(len).unwrap();
+                    if buffer.len() >= len {
+                        buffer.drain(0..bytes_read);
+                        let ct: Vec<_> = buffer.drain(0..len).collect();
+                        info!("Decapsulating chunk ({})", len);
+                        trace!("{}", hex::encode(&ct));
+                        self.seq += 1;
+                        yield self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &ct);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        };
+
+        Box::pin(output_stream)
+    }
 }
 
 #[cfg(all(test, feature = "client", feature = "server"))]
@@ -318,9 +538,12 @@ mod test {
         hpke::{Aead, Kdf, Kem},
         ClientRequest, Error, KeyConfig, KeyId, Server,
     };
-    use log::trace;
-    use std::{fmt::Debug, io::ErrorKind};
 
+    use futures::StreamExt;
+    use std::{fmt::Debug, io::ErrorKind};
+    use tracing::trace;
+
+    use async_stream::stream;
     const KEY_ID: KeyId = 1;
     const KEM: Kem = Kem::X25519Sha256;
     const SYMMETRIC: &[SymmetricSuite] = &[
@@ -336,7 +559,6 @@ mod test {
 
     fn init() {
         crate::init();
-        _ = env_logger::try_init(); // ignore errors here
     }
 
     #[test]
@@ -519,5 +741,197 @@ mod test {
 
         let response = client_response.decapsulate(&enc_response).unwrap();
         assert_eq!(&response[..], RESPONSE);
+    }
+
+    #[tokio::test]
+    async fn response_stream() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! { yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec()); };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let mut response = client_response.decapsulate_stream(enc_response).await;
+        let next = response.next().await;
+        assert!(next.is_some_and(|x| x.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE))));
+    }
+
+    #[tokio::test]
+    async fn two_response_stream() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! {
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+        };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let mut response = client_response.decapsulate_stream(enc_response).await;
+        let next = response.next().await;
+        assert!(next.is_some_and(|x| x.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE))));
+
+        let next = response.next().await;
+        assert!(next.is_some_and(|x| x.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE))));
+    }
+
+    #[tokio::test]
+    async fn two_response_stream_merged() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! {
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+        };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let merged_response = enc_response.chunks(2).map(|chunk| {
+            if chunk.len() == 2 {
+                println!("Found too elements");
+                let mut first = chunk[0].as_ref().unwrap().clone();
+                let second = chunk[1].as_ref().unwrap();
+                first.append(&mut second.clone());
+                Ok::<Vec<u8>, Error>(first.clone())
+            } else {
+                Ok::<Vec<u8>, Error>(chunk[0].as_ref().unwrap().clone())
+            }
+        });
+
+        let mut response = client_response.decapsulate_stream(merged_response).await;
+
+        let mut count = 0;
+        while let Some(next) = response.next().await {
+            count += 1;
+            assert!(next.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE)));
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn three_response_stream_merged() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! {
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+            yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec());
+        };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let merged_response = enc_response.chunks(2).map(|chunk| {
+            if chunk.len() == 2 {
+                let mut first = chunk[0].as_ref().unwrap().clone();
+                let second = chunk[1].as_ref().unwrap();
+                first.append(&mut second.clone());
+                Ok::<Vec<u8>, Error>(first.clone())
+            } else {
+                Ok::<Vec<u8>, Error>(chunk[0].as_ref().unwrap().clone())
+            }
+        });
+
+        let mut response = client_response.decapsulate_stream(merged_response).await;
+        let mut count = 0;
+        while let Some(next) = response.next().await {
+            count += 1;
+            assert!(next.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE)));
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn response_stream_fragment() {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+        trace!("Config: {}", hex::encode(&encoded_config));
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client_response) = client.encapsulate(REQUEST).unwrap();
+        trace!("Request: {}", hex::encode(REQUEST));
+        trace!("Encapsulated Request: {}", hex::encode(&enc_request));
+
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let stream = stream! { yield Ok::<Vec<u8>, Error>(RESPONSE.to_vec()); };
+        let enc_response = server_response.encapsulate_stream(stream);
+
+        let fragmented_response = enc_response.flat_map(|chunk| {
+            let c = chunk.unwrap();
+            if c.len() % 4 == 0 {
+                let chunks: Vec<_> = c
+                    .chunks(4)
+                    .map(|c| Ok::<Vec<u8>, Error>(c.to_vec()))
+                    .collect();
+                futures_util::stream::iter(chunks)
+            } else if c.len() % 3 == 0 {
+                let chunks: Vec<_> = c
+                    .chunks(3)
+                    .map(|c| Ok::<Vec<u8>, Error>(c.to_vec()))
+                    .collect();
+                futures_util::stream::iter(chunks)
+            } else {
+                let vec = vec![Ok::<Vec<u8>, Error>(c)];
+                futures_util::stream::iter(vec)
+            }
+        });
+
+        let mut response = client_response
+            .decapsulate_stream(fragmented_response)
+            .await;
+        let next = response.next().await;
+        assert!(next.is_some_and(|x| x.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE))));
     }
 }

@@ -15,12 +15,16 @@ pub enum Error {
     ExpectedResponse,
     #[error("a field contained an integer value that was out of range: {0}")]
     IntRange(#[from] std::num::TryFromIntError),
+    #[error("Invalid end of chunk. Expected zero-sized chunk")]
+    InvalidChunkEnd,
     #[error("the mode of the message was invalid")]
     InvalidMode,
     #[error("the status code of a response needs to be in 100..=599")]
     InvalidStatus,
     #[error("IO error {0}")]
     Io(#[from] std::io::Error),
+    #[error("Invalid uint")]
+    InvalidUint,
     #[error("a field or line was missing a necessary character 0x{0:x}")]
     Missing(u8),
     #[error("a URL was missing a key component")]
@@ -31,11 +35,15 @@ pub enum Error {
     ParseInt(#[from] std::num::ParseIntError),
     #[error("a field was truncated")]
     Truncated,
+    #[error("Unreachable")]
+    Unreachable,
     #[error("a message included the Upgrade field")]
     UpgradeUnsupported,
     #[error("a URL could not be parsed into components: {0}")]
     #[cfg(feature = "read-http")]
     UrlParse(#[from] url::ParseError),
+    #[error("Varint value too large")]
+    VariantTooLarge,
 }
 
 #[cfg(any(

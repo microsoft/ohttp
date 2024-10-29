@@ -6,8 +6,8 @@ use crate::{
     hpke::{Aead, Kdf},
 };
 use hkdf::Hkdf as HkdfImpl;
-use log::trace;
 use sha2::{Sha256, Sha384, Sha512};
+use tracing::trace;
 
 #[derive(Clone, Copy)]
 pub enum KeyMechanism {
