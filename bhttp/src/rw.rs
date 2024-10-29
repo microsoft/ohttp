@@ -10,7 +10,9 @@ use crate::{err::Error, ReadSeek};
 #[allow(clippy::cast_possible_truncation)]
 fn write_uint(n: u8, v: impl Into<u64>, w: &mut impl io::Write) -> Res<()> {
     let v = v.into();
-    assert!(n > 0 && usize::from(n) < std::mem::size_of::<u64>());
+    if !(n > 0 && usize::from(n) < std::mem::size_of::<u64>()) {
+        return Err(Error::InvalidUint);
+    }
     for i in 0..n {
         w.write_all(&[((v >> (8 * (n - i - 1))) & 0xff) as u8])?;
     }
@@ -25,7 +27,7 @@ pub fn write_varint(v: impl Into<u64>, w: &mut impl io::Write) -> Res<()> {
         () if v < (1 << 14) => write_uint(2, v | (1 << 14), w),
         () if v < (1 << 30) => write_uint(4, v | (2 << 30), w),
         () if v < (1 << 62) => write_uint(8, v | (3 << 62), w),
-        () => panic!("Varint value too large"),
+        () => Err(Error::VariantTooLarge),
     }
 }
 
@@ -74,7 +76,9 @@ where
             1 => ((b1 & 0x3f) << 8) | read_uint(1, r)?.ok_or(Error::Truncated)?,
             2 => ((b1 & 0x3f) << 24) | read_uint(3, r)?.ok_or(Error::Truncated)?,
             3 => ((b1 & 0x3f) << 56) | read_uint(7, r)?.ok_or(Error::Truncated)?,
-            _ => unreachable!(),
+            _ => {
+                return Err(Error::Unreachable);
+            }
         }))
     } else {
         Ok(None)

@@ -5,6 +5,8 @@ pub enum Error {
     #[cfg(feature = "rust-hpke")]
     #[error("a problem occurred with the AEAD")]
     Aead(#[from] aead::Error),
+    #[error("AEAD mode mismatch")]
+    AeadMode,
     #[cfg(feature = "nss")]
     #[error("a problem occurred during cryptographic processing: {0}")]
     Crypto(#[from] crate::nss::Error),
@@ -22,16 +24,24 @@ pub enum Error {
     InvalidKeyType,
     #[error("the wrong KEM was specified")]
     InvalidKem,
+    #[error("Invalid private key")]
+    InvalidPrivateKey,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("the key ID was invalid")]
     KeyId,
-    #[error("a field was truncated")]
-    Truncated,
-    #[error("the configuration was not supported")]
-    Unsupported,
+    #[error("Returned a different key ID from the one requested : {0} {1}")]
+    KeyIdMismatch(u8, u8),
+    #[error("Symmetric key is empty")]
+    SymmetricKeyEmpty,
     #[error("the configuration contained too many symmetric suites")]
     TooManySymmetricSuites,
+    #[error("a field was truncated")]
+    Truncated,
+    #[error("the two lengths are not equal : {0} {1}")]
+    UnequalLength(usize, usize),
+    #[error("the configuration was not supported")]
+    Unsupported,
 }
 
 impl From<std::num::TryFromIntError> for Error {
