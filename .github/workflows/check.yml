@@ -83,3 +83,20 @@ jobs:
         if: ${{ success() || failure() }}
         run: |
           cargo clippy --tests --no-default-features --features ${{ matrix.hpke }},client,server
+
+      - name: Install cargo-llvm-cov
+        if: matrix.rust == 'stable'
+        run: |
+          cargo install cargo-llvm-cov
+
+      - name: Generate coverage report
+        if: matrix.rust == 'stable'
+        run: |
+          cargo llvm-cov --features ${{ matrix.hpke }},client,server --cobertura --output-path target/cobertura.xml -- --test --test-threads=1
+
+      - name: Upload coverage artifact
+        if: matrix.rust == 'stable'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/cobertura.xml
