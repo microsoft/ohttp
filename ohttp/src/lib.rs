@@ -539,9 +539,11 @@ mod test {
         ClientRequest, Error, KeyConfig, KeyId, Server,
     };
 
-    use futures::StreamExt;
-    use std::{fmt::Debug, io::ErrorKind};
+    use futures::{channel::mpsc, poll, StreamExt};
+    use std::{fmt::Debug, io::ErrorKind, task::Poll};
     use tracing::trace;
+
+    use crate::ClientResponse;
 
     use async_stream::stream;
     const KEY_ID: KeyId = 1;
@@ -933,5 +935,571 @@ mod test {
             .await;
         let next = response.next().await;
         assert!(next.is_some_and(|x| x.is_ok_and(|x| x.eq_ignore_ascii_case(RESPONSE))));
+    }
+
+    // ------------------------------------------------------------------
+    // Response-stream framing regressions.
+    //
+    // F1: the availability check omitted the header bytes, so a later drain
+    //    could exceed the buffer.
+    // F2: incomplete and malformed length prefixes were indistinguishable
+    //    and both were unwrapped.
+    // ------------------------------------------------------------------
+
+    /// Deterministic plaintext large enough to force multi-byte length prefixes.
+    fn plaintext(seed: u8, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| seed.wrapping_add(u8::try_from(i % 251).unwrap()))
+            .collect()
+    }
+
+    /// Minimal LEB128 encoding, independent of the code under test.
+    fn encode_leb128(value: u64) -> Vec<u8> {
+        encode_leb128_width(value, 0)
+    }
+
+    /// LEB128 encoding padded out to `width` bytes, or minimal when `width` is 0.
+    fn encode_leb128_width(mut value: u64, width: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            #[allow(clippy::cast_possible_truncation)]
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 || out.len() + 1 < width {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 && out.len() >= width {
+                assert!(width == 0 || out.len() == width, "value exceeds {width} bytes");
+                return out;
+            }
+        }
+    }
+
+    /// Minimal LEB128 decoding, independent of the code under test.
+    fn decode_leb128(bytes: &[u8]) -> (u64, usize) {
+        let mut value = 0_u64;
+        let mut shift = 0;
+        for (index, &byte) in bytes.iter().enumerate() {
+            value |= u64::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                return (value, index + 1);
+            }
+            shift += 7;
+        }
+        panic!("test fixture contains an incomplete length prefix");
+    }
+
+    /// Header size (every prefix byte) and declared ciphertext length of a frame.
+    fn frame_geometry(frame: &[u8], is_final: bool) -> (usize, usize) {
+        let (first, first_width) = decode_leb128(frame);
+        let (header, len) = if is_final {
+            assert_eq!(first, 0, "a final frame starts with a zero indicator");
+            let (len, width) = decode_leb128(&frame[first_width..]);
+            (first_width + width, len)
+        } else {
+            assert_ne!(first, 0, "an ordinary frame starts with a non-zero length");
+            (first_width, first)
+        };
+        let len = usize::try_from(len).unwrap();
+        assert!(len >= 128, "fixture ciphertext is too small: {len}");
+        assert!(header > 1, "fixture header is not multi-byte: {header}");
+        assert_eq!(frame.len(), header + len, "fixture frame is malformed");
+        (header, len)
+    }
+
+    /// A real, encoder-produced response together with its matching client.
+    struct ResponseFixture {
+        client: ClientResponse,
+        nonce: Vec<u8>,
+        /// Encoded frames in order, excluding the response nonce.
+        frames: Vec<Vec<u8>>,
+    }
+
+    impl ResponseFixture {
+        /// The whole encoded response: nonce followed by every frame.
+        fn bytes(&self) -> Vec<u8> {
+            self.rebuilt(false)
+        }
+
+        /// The whole encoded response, optionally widening the final-frame
+        /// zero indicator to the equivalent non-minimal `80 00`.
+        fn rebuilt(&self, nonminimal_marker: bool) -> Vec<u8> {
+            let mut out = self.nonce.clone();
+            for (index, frame) in self.frames.iter().enumerate() {
+                if nonminimal_marker && index + 1 == self.frames.len() {
+                    assert_eq!(frame[0], 0x00);
+                    out.extend_from_slice(&[0x80, 0x00]);
+                    out.extend_from_slice(&frame[1..]);
+                } else {
+                    out.extend_from_slice(frame);
+                }
+            }
+            out
+        }
+    }
+
+    /// Encrypt `chunks` with the real server encoder and keep the client that
+    /// can decrypt them. Each call creates a fresh key pair and session.
+    async fn encode_response(chunks: &[Vec<u8>]) -> ResponseFixture {
+        init();
+
+        let server_config = KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap();
+        let server = Server::new(server_config).unwrap();
+        let encoded_config = server.config().encode().unwrap();
+
+        let client = ClientRequest::from_encoded_config(&encoded_config).unwrap();
+        let (enc_request, client) = client.encapsulate(REQUEST).unwrap();
+        let (request, server_response) = server.decapsulate(&enc_request).unwrap();
+        assert_eq!(&request[..], REQUEST);
+
+        let owned = chunks.to_vec();
+        let input = stream! {
+            for chunk in owned {
+                yield Ok::<Vec<u8>, Error>(chunk);
+            }
+        };
+
+        let mut encoded = server_response.encapsulate_stream(input);
+        let mut items = Vec::new();
+        while let Some(item) = encoded.next().await {
+            items.push(item.unwrap());
+        }
+
+        assert_eq!(items.len(), chunks.len() + 1, "nonce plus one frame per chunk");
+        let nonce = items.remove(0);
+        ResponseFixture {
+            client,
+            nonce,
+            frames: items,
+        }
+    }
+
+    /// Feed `pieces` as successive input items and drain the output to EOF.
+    async fn decapsulate_pieces(client: ClientResponse, pieces: Vec<Vec<u8>>) -> Vec<Res<Vec<u8>>> {
+        let input = Box::pin(stream! {
+            for piece in pieces {
+                yield Ok::<Vec<u8>, Error>(piece);
+            }
+        });
+
+        let mut output = client.decapsulate_stream(input).await;
+        let mut results = Vec::new();
+        while let Some(item) = output.next().await {
+            results.push(item);
+        }
+        results
+    }
+
+    /// Feed `head` over an input stream that stays open, take the `ready`
+    /// items it completes, assert the decoder then waits, feed `tail`, and
+    /// drain to EOF.
+    async fn decapsulate_resume(
+        client: ClientResponse,
+        head: Vec<u8>,
+        tail: Vec<u8>,
+        ready: usize,
+    ) -> Vec<Res<Vec<u8>>> {
+        let (tx, rx) = mpsc::unbounded::<Res<Vec<u8>>>();
+        tx.unbounded_send(Ok(head)).unwrap();
+
+        let mut output = client.decapsulate_stream(rx).await;
+        let mut results = Vec::new();
+        for _ in 0..ready {
+            match poll!(output.next()) {
+                Poll::Ready(Some(item)) => results.push(item),
+                other => panic!("expected a completed frame, got {other:?}"),
+            }
+        }
+        assert!(
+            poll!(output.next()).is_pending(),
+            "decoder emitted an item from an incomplete frame"
+        );
+
+        tx.unbounded_send(Ok(tail)).unwrap();
+        drop(tx);
+        while let Some(item) = output.next().await {
+            results.push(item);
+        }
+        results
+    }
+
+    /// Feed `head` over an input stream that stays open and require an error
+    /// without waiting for further input, followed by end of stream.
+    async fn assert_immediate_format_error(client: ClientResponse, head: Vec<u8>) {
+        let (tx, rx) = mpsc::unbounded::<Res<Vec<u8>>>();
+        tx.unbounded_send(Ok(head)).unwrap();
+
+        let mut output = client.decapsulate_stream(rx).await;
+        match poll!(output.next()) {
+            Poll::Ready(Some(Err(Error::Format))) => {}
+            other => panic!("expected an immediate Format error, got {other:?}"),
+        }
+        assert!(
+            matches!(poll!(output.next()), Poll::Ready(None)),
+            "the output stream must end after a Format error"
+        );
+        drop(tx);
+    }
+
+    /// Assert the output is exactly `expected`, in order, with no error.
+    fn assert_exact_plaintext(results: Vec<Res<Vec<u8>>>, expected: &[Vec<u8>]) {
+        assert_eq!(results.len(), expected.len(), "unexpected item count");
+        for (got, want) in results.into_iter().zip(expected.iter()) {
+            assert_eq!(&got.unwrap()[..], &want[..]);
+        }
+    }
+
+    /// Assert the output is `expected` followed by exactly one `Truncated`.
+    fn assert_plaintext_then_truncated(results: Vec<Res<Vec<u8>>>, expected: &[Vec<u8>]) {
+        assert_eq!(
+            results.len(),
+            expected.len() + 1,
+            "expected one trailing error"
+        );
+        let mut items = results.into_iter();
+        for want in expected {
+            assert_eq!(&items.next().unwrap().unwrap()[..], &want[..]);
+        }
+        let err = items.next().unwrap().unwrap_err();
+        assert!(matches!(err, Error::Truncated), "expected Truncated: {err:?}");
+    }
+
+    /// Two chunks, each large enough to need a multi-byte length prefix.
+    fn two_chunks() -> Vec<Vec<u8>> {
+        vec![plaintext(0x11, 300), plaintext(0x55, 288)]
+    }
+
+    #[tokio::test]
+    async fn response_stream_fragment_every_offset_large_chunk() {
+        let chunks = two_chunks();
+
+        // All bytes delivered as a single item.
+        let fixture = encode_response(&chunks).await;
+        let total = fixture.bytes().len();
+        let bytes = fixture.bytes();
+        let results = decapsulate_pieces(fixture.client, vec![bytes]).await;
+        assert_exact_plaintext(results, &chunks);
+
+        // Every two-part split, covering the nonce, both prefixes and payloads.
+        for split in 1..total {
+            let fixture = encode_response(&chunks).await;
+            let bytes = fixture.bytes();
+            assert_eq!(bytes.len(), total);
+            let pieces = vec![bytes[..split].to_vec(), bytes[split..].to_vec()];
+            let results = decapsulate_pieces(fixture.client, pieces).await;
+            assert_exact_plaintext(results, &chunks);
+        }
+
+        // One byte at a time.
+        let fixture = encode_response(&chunks).await;
+        let pieces = fixture.bytes().iter().map(|b| vec![*b]).collect();
+        let results = decapsulate_pieces(fixture.client, pieces).await;
+        assert_exact_plaintext(results, &chunks);
+    }
+
+    /// Every buffer size from `L` to `L + H - 1`, where the declared ciphertext
+    /// length `L` is satisfied by the buffer only because header bytes are
+    /// counted as payload.
+    async fn prefix_payload_boundary_case(chunks: &[Vec<u8>], is_final: bool) {
+        let chunks = chunks.to_vec();
+        let probe = encode_response(&chunks).await;
+        let (header, ct_len) = frame_geometry(&probe.frames[0], is_final);
+
+        for size in ct_len..(ct_len + header) {
+            let fixture = encode_response(&chunks).await;
+            let bytes = fixture.bytes();
+            let split = fixture.nonce.len() + size;
+
+            // Nothing may be emitted before the rest of the frame arrives.
+            let results = decapsulate_resume(
+                fixture.client,
+                bytes[..split].to_vec(),
+                bytes[split..].to_vec(),
+                0,
+            )
+            .await;
+            assert_exact_plaintext(results, &chunks);
+
+            // Closing the input at the same boundary truncates.
+            let fixture = encode_response(&chunks).await;
+            let bytes = fixture.bytes();
+            let results = decapsulate_pieces(fixture.client, vec![bytes[..split].to_vec()]).await;
+            assert_plaintext_then_truncated(results, &[]);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_prefix_payload_boundary() {
+        // A two-chunk response starts with an ordinary frame.
+        prefix_payload_boundary_case(&two_chunks(), false).await;
+        // A single-chunk response is a lone final frame.
+        prefix_payload_boundary_case(&[plaintext(0x33, 320)], true).await;
+
+        // Direct F1 regression: `82 01` declares 130 ciphertext bytes while
+        // only 128 arrive, so the header bytes alone satisfy the buggy check.
+        let fixture = encode_response(&[plaintext(0x44, 256)]).await;
+        let mut bytes = fixture.nonce.clone();
+        bytes.extend_from_slice(&[0x82, 0x01]);
+        bytes.extend_from_slice(&[0_u8; 128]);
+        let results = decapsulate_pieces(fixture.client, vec![bytes]).await;
+        assert_plaintext_then_truncated(results, &[]);
+    }
+
+    /// A valid but incomplete prefix must wait, then truncate at EOF.
+    async fn incomplete_prefix_case(partial: &[u8], marker: &[u8]) {
+        let mut tail = marker.to_vec();
+        tail.extend_from_slice(partial);
+        assert!(!tail.is_empty());
+
+        let fixture = encode_response(&[plaintext(0x11, 300)]).await;
+        let (tx, rx) = mpsc::unbounded::<Res<Vec<u8>>>();
+        let mut head = fixture.nonce.clone();
+        head.extend_from_slice(&tail);
+        tx.unbounded_send(Ok(head)).unwrap();
+
+        let mut output = fixture.client.decapsulate_stream(rx).await;
+        assert!(
+            poll!(output.next()).is_pending(),
+            "decoder emitted an item from an incomplete length prefix"
+        );
+
+        drop(tx);
+        let mut results = Vec::new();
+        while let Some(item) = output.next().await {
+            results.push(item);
+        }
+        assert_plaintext_then_truncated(results, &[]);
+    }
+
+    #[tokio::test]
+    async fn response_stream_incomplete_length() {
+        let prefixes = [
+            encode_leb128(128),
+            encode_leb128(16384),
+            encode_leb128(u64::from(u32::MAX) + 1),
+        ];
+
+        for prefix in &prefixes {
+            assert!(prefix.len() > 1);
+            for split in 1..prefix.len() {
+                // First length position, then the final-frame second position.
+                incomplete_prefix_case(&prefix[..split], &[]).await;
+                incomplete_prefix_case(&prefix[..split], &[0x00]).await;
+            }
+        }
+
+        // A lone continuation byte in either position.
+        incomplete_prefix_case(&[0x80], &[]).await;
+        incomplete_prefix_case(&[0x80], &[0x00]).await;
+        // A zero indicator with no second prefix at all.
+        incomplete_prefix_case(&[], &[0x00]).await;
+    }
+
+    /// Prefixes that can never become valid, regardless of further input.
+    fn overlong_prefixes() -> Vec<Vec<u8>> {
+        let mut invalid = vec![vec![0x80; 10]];
+        // The tenth byte may only be a terminal `00` or `01`.
+        for terminal in [0x02_u8, 0x7F, 0x80, 0x81, 0xFF] {
+            let mut prefix = vec![0x80; 9];
+            prefix.push(terminal);
+            invalid.push(prefix);
+        }
+        invalid
+    }
+
+    #[tokio::test]
+    async fn response_stream_overlong_length() {
+        for prefix in overlong_prefixes() {
+            for marker in [&[][..], &[0x00][..]] {
+                for trailing in [0_usize, 32] {
+                    let fixture = encode_response(&[plaintext(0x11, 300)]).await;
+                    let mut head = fixture.nonce.clone();
+                    head.extend_from_slice(marker);
+                    head.extend_from_slice(&prefix);
+                    head.extend_from_slice(&vec![0xAA_u8; trailing]);
+                    assert_immediate_format_error(fixture.client, head).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_length_overflow() {
+        // A representable length whose header plus payload cannot fit `usize`.
+        let saturated = encode_leb128(u64::try_from(usize::MAX).unwrap());
+        for marker in [&[][..], &[0x00][..]] {
+            let fixture = encode_response(&[plaintext(0x11, 300)]).await;
+            let mut head = fixture.nonce.clone();
+            head.extend_from_slice(marker);
+            head.extend_from_slice(&saturated);
+            assert_immediate_format_error(fixture.client, head).await;
+        }
+
+        // A length that cannot be converted to `usize` at all.
+        #[cfg(target_pointer_width = "32")]
+        {
+            let too_large = encode_leb128(u64::from(u32::MAX) + 1);
+            for marker in [&[][..], &[0x00][..]] {
+                let fixture = encode_response(&[plaintext(0x11, 300)]).await;
+                let mut head = fixture.nonce.clone();
+                head.extend_from_slice(marker);
+                head.extend_from_slice(&too_large);
+                assert_immediate_format_error(fixture.client, head).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_fragmented_final_marker() {
+        let chunks = two_chunks();
+        let probe = encode_response(&chunks).await;
+        let prologue = probe.nonce.len() + probe.frames[0].len();
+        let (header, ct_len) = frame_geometry(&probe.frames[1], true);
+
+        for nonminimal in [false, true] {
+            let extra = usize::from(nonminimal);
+            let marker = 1 + extra;
+            // Pause after the indicator, inside the length, and inside the payload.
+            let offsets = [
+                marker,
+                marker + 1,
+                header + extra,
+                header + extra + 1,
+                header + extra + ct_len / 2,
+            ];
+
+            for offset in offsets {
+                let fixture = encode_response(&chunks).await;
+                let bytes = fixture.rebuilt(nonminimal);
+                let split = prologue + offset;
+                // The ordinary frame is already complete in `head`.
+                let results = decapsulate_resume(
+                    fixture.client,
+                    bytes[..split].to_vec(),
+                    bytes[split..].to_vec(),
+                    1,
+                )
+                .await;
+                assert_exact_plaintext(results, &chunks);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_nonminimal_lengths() {
+        let chunks = two_chunks();
+        let probe = encode_response(&chunks).await;
+        let (ordinary_header, ordinary_len) = frame_geometry(&probe.frames[0], false);
+        let (final_header, final_len) = frame_geometry(&probe.frames[1], true);
+
+        for extra in [1_usize, 3] {
+            let fixture = encode_response(&chunks).await;
+            let mut bytes = fixture.nonce.clone();
+
+            // Ordinary length prefix, widened.
+            bytes.extend_from_slice(&encode_leb128_width(
+                u64::try_from(ordinary_len).unwrap(),
+                ordinary_header + extra,
+            ));
+            bytes.extend_from_slice(&fixture.frames[0][ordinary_header..]);
+
+            // Final indicator and final length prefix, both widened.
+            bytes.extend_from_slice(&encode_leb128_width(0, 1 + extra));
+            bytes.extend_from_slice(&encode_leb128_width(
+                u64::try_from(final_len).unwrap(),
+                final_header - 1 + extra,
+            ));
+            bytes.extend_from_slice(&fixture.frames[1][final_header..]);
+
+            let results = decapsulate_pieces(fixture.client, vec![bytes]).await;
+            assert_exact_plaintext(results, &chunks);
+        }
+    }
+
+    /// Cut the payload of one frame at every incomplete offset.
+    async fn truncated_payload_case(chunks: &[Vec<u8>], frame_index: usize, is_final: bool) {
+        let chunks = chunks.to_vec();
+        let probe = encode_response(&chunks).await;
+        let prologue =
+            probe.nonce.len() + probe.frames[..frame_index].iter().map(Vec::len).sum::<usize>();
+        let (header, ct_len) = frame_geometry(&probe.frames[frame_index], is_final);
+        let expected = chunks[..frame_index].to_vec();
+
+        for payload in 0..ct_len {
+            let fixture = encode_response(&chunks).await;
+            let bytes = fixture.bytes();
+            let cut = prologue + header + payload;
+            let results = decapsulate_pieces(fixture.client, vec![bytes[..cut].to_vec()]).await;
+            assert_plaintext_then_truncated(results, &expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_truncated_ciphertext() {
+        // A lone final frame.
+        truncated_payload_case(&[plaintext(0x33, 320)], 0, true).await;
+        // A partial ordinary frame.
+        truncated_payload_case(&two_chunks(), 0, false).await;
+        // A complete ordinary frame followed by a partial final frame.
+        truncated_payload_case(&two_chunks(), 1, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_stream_large_declared_length() {
+        // Large enough that buffering it would be obvious, small enough to be
+        // representable on 32-bit targets.
+        let declared = encode_leb128(1 << 30);
+
+        for marker in [&[][..], &[0x00][..]] {
+            let fixture = encode_response(&[plaintext(0x11, 300)]).await;
+            let (tx, rx) = mpsc::unbounded::<Res<Vec<u8>>>();
+            let mut head = fixture.nonce.clone();
+            head.extend_from_slice(marker);
+            head.extend_from_slice(&declared);
+            tx.unbounded_send(Ok(head)).unwrap();
+
+            let mut output = fixture.client.decapsulate_stream(rx).await;
+            assert!(
+                poll!(output.next()).is_pending(),
+                "decoder must wait for a declared payload that never arrives"
+            );
+
+            drop(tx);
+            let mut results = Vec::new();
+            while let Some(item) = output.next().await {
+                results.push(item);
+            }
+            assert_plaintext_then_truncated(results, &[]);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_clean_boundary_eof() {
+        let chunks = two_chunks();
+
+        // Empty outer input.
+        let fixture = encode_response(&chunks).await;
+        let results = decapsulate_pieces(fixture.client, Vec::new()).await;
+        assert_exact_plaintext(results, &[]);
+
+        // A complete response nonce and nothing else.
+        let fixture = encode_response(&chunks).await;
+        let nonce = fixture.nonce.clone();
+        let results = decapsulate_pieces(fixture.client, vec![nonce]).await;
+        assert_exact_plaintext(results, &[]);
+
+        // A complete ordinary frame followed by end of input.
+        let fixture = encode_response(&chunks).await;
+        let mut bytes = fixture.nonce.clone();
+        bytes.extend_from_slice(&fixture.frames[0]);
+        let results = decapsulate_pieces(fixture.client, vec![bytes]).await;
+        assert_exact_plaintext(results, &chunks[..1]);
+
+        // The whole response, including the final frame.
+        let fixture = encode_response(&chunks).await;
+        let bytes = fixture.bytes();
+        let results = decapsulate_pieces(fixture.client, vec![bytes]).await;
+        assert_exact_plaintext(results, &chunks);
     }
 }
