@@ -66,6 +66,16 @@ jobs:
           git clone --depth 1 https://github.com/nss-dev/nss "$NSS_DIR"
           echo "LD_LIBRARY_PATH=${{ github.workspace }}/dist/Debug/lib" >> "$GITHUB_ENV"
 
+      # Cargo before 1.84 cannot select dependency versions by rust-version,
+      # so resolve them with stable Cargo before building with the minimum version.
+      - name: Resolve dependencies for the minimum Rust version
+        if: matrix.rust != 'stable'
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable generate-lockfile
+
       - name: Build
         run: |
           cargo +${{ matrix.rust }} build --tests --no-default-features --features ${{ matrix.hpke }},client,server
