@@ -56,6 +56,9 @@ use crate::rh::{
 
 /// The request header is a `KeyId` and 2 each for KEM, KDF, and AEAD identifiers
 const REQUEST_HEADER_LEN: usize = size_of::<KeyId>() + 6;
+/// The most bytes a variable-length integer can use to carry a `u64`:
+/// nine groups of seven value bits plus a tenth byte holding the last bit.
+const MAX_VARINT_LEN: usize = 10;
 const INFO_REQUEST: &[u8] = b"message/bhttp request";
 /// The info used for HPKE export is `INFO_REQUEST`, a zero byte, and the header.
 const INFO_LEN: usize = INFO_REQUEST.len() + 1 + REQUEST_HEADER_LEN;
@@ -447,27 +450,59 @@ impl ClientResponse {
         Ok(())
     }
 
-    fn variant_decode(&mut self, bytes: &[u8]) -> Result<(u64, usize), String> {
+    /// Decode a variable-length integer prefix without consuming any input.
+    ///
+    /// Returns `Ok(Some((value, width)))` for a complete prefix, where `width`
+    /// is the number of bytes it occupies, `Ok(None)` when `bytes` holds a
+    /// valid prefix that needs more input, and `Err(Error::Format)` when the
+    /// prefix can never become valid.
+    ///
+    /// Valid non-minimal encodings are accepted, so `81 00` decodes to 1.
+    fn variant_decode(bytes: &[u8]) -> Res<Option<(u64, usize)>> {
         let mut value: u64 = 0;
         let mut shift = 0;
-        let mut bytes_read = 0;
 
-        for &byte in bytes {
-            let byte_value = (byte & 0x7F) as u64;
-            value |= byte_value << shift;
-            bytes_read += 1;
+        for (index, &byte) in bytes.iter().take(MAX_VARINT_LEN).enumerate() {
+            // Only two value bits remain in the last permitted byte, and the
+            // prefix has to terminate there. Check before accumulating so an
+            // over-long prefix can never shift out of range.
+            if index == MAX_VARINT_LEN - 1 && byte != 0x00 && byte != 0x01 {
+                return Err(Error::Format);
+            }
+            value |= u64::from(byte & 0x7F) << shift;
             if byte & 0x80 == 0 {
-                // Continuation bit is not set, end of the VLQ-encoded integer
-                return Ok((value, bytes_read));
+                return Ok(Some((value, index + 1)));
             }
             shift += 7;
-            if shift >= 64 {
-                return Err("VLQ-encoded integer is too large".to_string());
-            }
         }
-        Err("Incomplete VLQ-encoded integer".to_string())
+
+        // Every byte set the continuation bit, but fewer than MAX_VARINT_LEN
+        // of them are available, so the prefix may still complete.
+        Ok(None)
     }
 
+    /// Decapsulate a chunked response stream.
+    ///
+    /// This decodes the legacy framing produced by
+    /// `ServerResponse::encapsulate_stream`: a response nonce, zero or more
+    /// ordinary frames of `[length][ciphertext]`, and a final frame of
+    /// `[zero indicator][length][ciphertext]`, where each length is a
+    /// variable-length integer counting encrypted bytes.
+    ///
+    /// Frame bytes are buffered until a whole frame is present, so a frame may
+    /// be split across any number of input items. No memory is reserved from a
+    /// declared length before those bytes arrive.
+    ///
+    /// The output stream ends after the first error it yields:
+    ///
+    /// * `Error::Format` for a length prefix that is malformed, too large to
+    ///   represent, or that describes a frame larger than `usize`.
+    /// * `Error::Truncated` when the input ends while a frame is incomplete.
+    ///
+    /// A frame that fails authentication yields the AEAD error. Input that
+    /// ends on a frame boundary ends the output stream normally; this decoder
+    /// does not require a final frame and does not reject trailing data beyond
+    /// the normal framing rules.
     pub async fn decapsulate_stream<S>(
         mut self,
         mut stream: S,
@@ -496,33 +531,76 @@ impl ClientResponse {
                 }
 
                 while nonce_received && !buffer.is_empty() {
-                    let (mut len, mut bytes_read) = self.variant_decode(&buffer).unwrap();
-                    info!("Buffer state: {}, {}({})", buffer.len(), len, bytes_read);
+                    // Length (i) = 1.., or Final Response Chunk Indicator (i) = 0.
+                    // Nothing is consumed until the whole frame is available.
+                    let first = match Self::variant_decode(&buffer) {
+                        Ok(Some(first)) => first,
+                        Ok(None) => break,
+                        Err(e) => {
+                            info!("Invalid chunk length prefix");
+                            yield Err(e);
+                            return;
+                        }
+                    };
 
-                    // Final Response Chunk Indicator (i) = 0,
-                    if len == 0 {
-                        buffer.drain(0..bytes_read);
+                    // The final marker only takes effect once its frame is consumed.
+                    let mut staged_aad = aad;
+                    let (header_len, len) = if first.0 == 0 {
                         info!("Processing final chunk");
-                        aad = "final";
-                        let (length, bytes) = self.variant_decode(&buffer).unwrap();
-                        info!("Buffer state: {}({})", length, bytes_read);
-                        len = length;
-                        bytes_read = bytes;
-                    }
-
-                    // Decapsulate chunk if received
-                    let len = usize::try_from(len).unwrap();
-                    if buffer.len() >= len {
-                        buffer.drain(0..bytes_read);
-                        let ct: Vec<_> = buffer.drain(0..len).collect();
-                        info!("Decapsulating chunk ({})", len);
-                        trace!("{}", hex::encode(&ct));
-                        self.seq += 1;
-                        yield self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &ct);
+                        staged_aad = "final";
+                        let second = match Self::variant_decode(&buffer[first.1..]) {
+                            Ok(Some(second)) => second,
+                            Ok(None) => break,
+                            Err(e) => {
+                                info!("Invalid final chunk length prefix");
+                                yield Err(e);
+                                return;
+                            }
+                        };
+                        let Some(header_len) = first.1.checked_add(second.1) else {
+                            info!("Final chunk header size is not representable");
+                            yield Err(Error::Format);
+                            return;
+                        };
+                        (header_len, second.0)
                     } else {
+                        (first.1, first.0)
+                    };
+
+                    // The declared length is attacker controlled. Convert and
+                    // add explicitly; the shared TryFromIntError conversion
+                    // reports an unrelated error for this case.
+                    let Ok(len) = usize::try_from(len) else {
+                        info!("Chunk length is not representable");
+                        yield Err(Error::Format);
+                        return;
+                    };
+                    let Some(frame_len) = header_len.checked_add(len) else {
+                        info!("Chunk size is not representable");
+                        yield Err(Error::Format);
+                        return;
+                    };
+                    info!("Buffer state: {}, chunk {}({})", buffer.len(), len, header_len);
+
+                    // Wait for the rest of the frame without consuming anything.
+                    if buffer.len() < frame_len {
                         break;
                     }
+
+                    aad = staged_aad;
+                    buffer.drain(0..header_len);
+                    let ct: Vec<_> = buffer.drain(0..len).collect();
+                    info!("Decapsulating chunk ({})", len);
+                    trace!("{}", hex::encode(&ct));
+                    self.seq += 1;
+                    yield self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &ct);
                 }
+            }
+
+            // Input ended partway through a frame.
+            if nonce_received && !buffer.is_empty() {
+                info!("Incomplete chunk at end of stream ({})", buffer.len());
+                yield Err(Error::Truncated);
             }
         };
 
@@ -536,14 +614,12 @@ mod test {
         config::SymmetricSuite,
         err::Res,
         hpke::{Aead, Kdf, Kem},
-        ClientRequest, Error, KeyConfig, KeyId, Server,
+        ClientRequest, ClientResponse, Error, KeyConfig, KeyId, Server, MAX_VARINT_LEN,
     };
 
     use futures::{channel::mpsc, poll, StreamExt};
     use std::{fmt::Debug, io::ErrorKind, task::Poll};
     use tracing::trace;
-
-    use crate::ClientResponse;
 
     use async_stream::stream;
     const KEY_ID: KeyId = 1;
@@ -970,7 +1046,10 @@ mod test {
             }
             out.push(byte);
             if value == 0 && out.len() >= width {
-                assert!(width == 0 || out.len() == width, "value exceeds {width} bytes");
+                assert!(
+                    width == 0 || out.len() == width,
+                    "value exceeds {width} bytes"
+                );
                 return out;
             }
         }
@@ -1066,7 +1145,11 @@ mod test {
             items.push(item.unwrap());
         }
 
-        assert_eq!(items.len(), chunks.len() + 1, "nonce plus one frame per chunk");
+        assert_eq!(
+            items.len(),
+            chunks.len() + 1,
+            "nonce plus one frame per chunk"
+        );
         let nonce = items.remove(0);
         ResponseFixture {
             client,
@@ -1162,12 +1245,85 @@ mod test {
             assert_eq!(&items.next().unwrap().unwrap()[..], &want[..]);
         }
         let err = items.next().unwrap().unwrap_err();
-        assert!(matches!(err, Error::Truncated), "expected Truncated: {err:?}");
+        assert!(
+            matches!(err, Error::Truncated),
+            "expected Truncated: {err:?}"
+        );
     }
 
     /// Two chunks, each large enough to need a multi-byte length prefix.
     fn two_chunks() -> Vec<Vec<u8>> {
         vec![plaintext(0x11, 300), plaintext(0x55, 288)]
+    }
+
+    #[test]
+    fn response_stream_length_decode_states() {
+        // Empty input is indistinguishable from a prefix needing more bytes.
+        assert!(matches!(ClientResponse::variant_decode(&[]), Ok(None)));
+
+        let values = [
+            0_u64,
+            1,
+            127,
+            128,
+            16383,
+            16384,
+            u64::from(u32::MAX) + 1,
+            u64::MAX,
+        ];
+        for value in values {
+            let encoded = encode_leb128(value);
+            assert_eq!(
+                ClientResponse::variant_decode(&encoded).unwrap(),
+                Some((value, encoded.len()))
+            );
+
+            // Bytes after the terminator belong to the frame, not the prefix.
+            let mut padded = encoded.clone();
+            padded.extend_from_slice(&[0xFF; 4]);
+            assert_eq!(
+                ClientResponse::variant_decode(&padded).unwrap(),
+                Some((value, encoded.len()))
+            );
+
+            // Every proper prefix is incomplete rather than invalid.
+            for split in 0..encoded.len() {
+                assert!(
+                    matches!(ClientResponse::variant_decode(&encoded[..split]), Ok(None)),
+                    "value {value} split at {split}"
+                );
+            }
+        }
+
+        // A representative encoding of every width, split at each byte.
+        for width in 2..=MAX_VARINT_LEN {
+            let encoded = encode_leb128_width(1, width);
+            assert_eq!(encoded.len(), width);
+            for split in 0..width {
+                assert!(
+                    matches!(ClientResponse::variant_decode(&encoded[..split]), Ok(None)),
+                    "width {width} split at {split}"
+                );
+            }
+            assert_eq!(
+                ClientResponse::variant_decode(&encoded).unwrap(),
+                Some((1, width))
+            );
+        }
+
+        // Prefixes that can never become valid, with and without trailing bytes.
+        for prefix in overlong_prefixes() {
+            assert!(
+                matches!(ClientResponse::variant_decode(&prefix), Err(Error::Format)),
+                "{prefix:?}"
+            );
+            let mut padded = prefix.clone();
+            padded.extend_from_slice(&[0x00; 4]);
+            assert!(
+                matches!(ClientResponse::variant_decode(&padded), Err(Error::Format)),
+                "{padded:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1415,14 +1571,29 @@ mod test {
             let results = decapsulate_pieces(fixture.client, vec![bytes]).await;
             assert_exact_plaintext(results, &chunks);
         }
+
+        // A terminal `00` or `01` in the last permitted byte decodes, even
+        // though the resulting frame size is rejected later. The frame-level
+        // rejection is covered by `response_stream_length_overflow`.
+        for (terminal, expected) in [(0x00_u8, (1_u64 << 63) - 1), (0x01_u8, u64::MAX)] {
+            let mut prefix = vec![0xFF; MAX_VARINT_LEN - 1];
+            prefix.push(terminal);
+            assert_eq!(
+                ClientResponse::variant_decode(&prefix).unwrap(),
+                Some((expected, MAX_VARINT_LEN))
+            );
+        }
     }
 
     /// Cut the payload of one frame at every incomplete offset.
     async fn truncated_payload_case(chunks: &[Vec<u8>], frame_index: usize, is_final: bool) {
         let chunks = chunks.to_vec();
         let probe = encode_response(&chunks).await;
-        let prologue =
-            probe.nonce.len() + probe.frames[..frame_index].iter().map(Vec::len).sum::<usize>();
+        let prologue = probe.nonce.len()
+            + probe.frames[..frame_index]
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
         let (header, ct_len) = frame_geometry(&probe.frames[frame_index], is_final);
         let expected = chunks[..frame_index].to_vec();
 
