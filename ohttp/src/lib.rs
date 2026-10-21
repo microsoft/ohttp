@@ -498,11 +498,12 @@ impl ClientResponse {
     /// * `Error::Format` for a length prefix that is malformed, too large to
     ///   represent, or that describes a frame larger than `usize`.
     /// * `Error::Truncated` when the input ends while a frame is incomplete.
+    /// * The AEAD error (`Error::Aead` with `rust-hpke`, `Error::Crypto` with
+    ///   `nss`) when a frame fails authentication.
     ///
-    /// A frame that fails authentication yields the AEAD error. Input that
-    /// ends on a frame boundary ends the output stream normally; this decoder
-    /// does not require a final frame and does not reject trailing data beyond
-    /// the normal framing rules.
+    /// Input that ends on a frame boundary ends the output stream normally;
+    /// this decoder does not require a final frame and does not reject
+    /// trailing data beyond the normal framing rules.
     pub async fn decapsulate_stream<S>(
         mut self,
         mut stream: S,
@@ -593,7 +594,14 @@ impl ClientResponse {
                     info!("Decapsulating chunk ({})", len);
                     trace!("{}", hex::encode(&ct));
                     self.seq += 1;
-                    yield self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &ct);
+                    match self.aead.as_mut().unwrap().open(aad.as_bytes(), self.seq - 1, &ct) {
+                        Ok(plaintext) => yield Ok(plaintext),
+                        Err(e) => {
+                            info!("Chunk failed authentication");
+                            yield Err(e);
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -1251,6 +1259,39 @@ mod test {
         );
     }
 
+    /// Assert `res` is the backend's authentication error. Unlike
+    /// `assert_truncated`, no other error variant is accepted.
+    fn assert_auth_error<T: Debug>(res: Res<T>) {
+        match res {
+            #[cfg(feature = "rust-hpke")]
+            Err(Error::Aead(_)) => {}
+            #[cfg(feature = "nss")]
+            Err(Error::Crypto(_)) => {}
+            other => panic!("expected an authentication error, got {other:?}"),
+        }
+    }
+
+    /// Assert the output is exactly one authentication error.
+    fn assert_only_auth_error(mut results: Vec<Res<Vec<u8>>>) {
+        let summary: Vec<_> = results.iter().map(|r| r.as_ref().map(Vec::len)).collect();
+        assert_eq!(
+            results.len(),
+            1,
+            "expected only an authentication error: {summary:?}"
+        );
+        assert_auth_error(results.remove(0));
+    }
+
+    /// A real `two_chunks` response whose ordinary frame fails authentication.
+    /// One ciphertext byte after the length header is flipped, so the framing
+    /// stays valid.
+    async fn corrupted_two_chunk_response() -> ResponseFixture {
+        let mut fixture = encode_response(&two_chunks()).await;
+        let (header, _) = frame_geometry(&fixture.frames[0], false);
+        fixture.frames[0][header] ^= 0x01;
+        fixture
+    }
+
     /// Two chunks, each large enough to need a multi-byte length prefix.
     fn two_chunks() -> Vec<Vec<u8>> {
         vec![plaintext(0x11, 300), plaintext(0x55, 288)]
@@ -1672,5 +1713,44 @@ mod test {
         let bytes = fixture.bytes();
         let results = decapsulate_pieces(fixture.client, vec![bytes]).await;
         assert_exact_plaintext(results, &chunks);
+    }
+
+    #[tokio::test]
+    async fn response_stream_auth_error_then_valid_final() {
+        // Drained to EOF: the valid final frame is never decrypted.
+        let fixture = corrupted_two_chunk_response().await;
+        let bytes = fixture.bytes();
+        let results = decapsulate_pieces(fixture.client, vec![bytes]).await;
+        assert_only_auth_error(results);
+
+        // With the input still open, the stream ends right after the error.
+        let fixture = corrupted_two_chunk_response().await;
+        let (tx, rx) = mpsc::unbounded::<Res<Vec<u8>>>();
+        tx.unbounded_send(Ok(fixture.bytes())).unwrap();
+        let mut output = fixture.client.decapsulate_stream(rx).await;
+        match poll!(output.next()) {
+            Poll::Ready(Some(item)) => assert_auth_error(item),
+            other => panic!("expected an immediate authentication error, got {other:?}"),
+        }
+        let next = poll!(output.next());
+        assert!(
+            matches!(next, Poll::Ready(None)),
+            "the output stream must end after an authentication error, got {:?}",
+            next.map(|item| item.map(|res| res.map(|pt| pt.len())))
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn response_stream_auth_error_then_truncated_final() {
+        let fixture = corrupted_two_chunk_response().await;
+        let (header, ct_len) = frame_geometry(&fixture.frames[1], true);
+        let mut bytes = fixture.nonce.clone();
+        bytes.extend_from_slice(&fixture.frames[0]);
+        bytes.extend_from_slice(&fixture.frames[1][..header + ct_len / 2]);
+
+        // No `Truncated` (or unexpected-EOF `Io`) error follows.
+        let results = decapsulate_pieces(fixture.client, vec![bytes]).await;
+        assert_only_auth_error(results);
     }
 }
